@@ -1,0 +1,1 @@
+<workspace-brand-component :brand_session="{{ session()->has('brand') ? \Session::get('brand') : 'false'}}" :active_organization="{{session()->get('active_organization')}}"></workspace-brand-component>

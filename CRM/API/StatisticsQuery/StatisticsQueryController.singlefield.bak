@@ -1,0 +1,357 @@
+<?php
+
+namespace CRM\API\StatisticsQuery;
+
+use App\Http\Controllers\Controller;
+use App\Models\StatisticsQuery;
+use App\Models\StatisticsTable;
+use App\Models\StatisticsField;
+use App\Models\StatisticsExtension;
+use App\Models\Category;
+use App\Models\CategoryStatisticsQuery;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\DB;
+
+class StatisticsQueryController extends Controller
+{
+   private $statisticsQueryRepository;
+
+   public function __construct(StatisticsQueryRepository $statisticsQueryRepository)
+   {
+      $this->statisticsQueryRepository = $statisticsQueryRepository;
+   }
+
+   public function index()
+   {
+      $data = StatisticsQuery::all();
+
+      return response()->json($data);
+   }
+   
+   public function tables()
+   {
+      $data = StatisticsTable::all();
+
+      return response()->json($data);
+   }
+
+   public function fields(Request $request)
+   {
+      $data = StatisticsTable::findOrfail($request->table);
+      $data = $data->fields;
+
+      return response()->json($data);
+   }
+
+   public function show(Request $request, $id)
+   {
+      $statisticsQuery = $this->statisticsQueryRepository->getById($id);
+      
+      return response()->json($statisticsQuery);
+   }
+
+   public function fetchTableFields(Request $request){
+      $fields = DB::select('DESCRIBE ' . $request->table);
+      $data = [];
+
+      $restricted_fields = $this->restrictedFields();
+
+      foreach($fields as $field){
+         if(!in_array($field->Field, $restricted_fields)){
+            $data[] = [
+               "name" => $this->unslugify(\ucwords($field->Field)),
+               "field" => $field->Field,
+            ];
+         }
+      }
+       $this->queryBuilder($request_query);
+
+      return response()->json($data);
+   }
+
+   public function unslugify($string){
+      $string = \str_replace("_", " ", $string);
+      return \ucwords($string);
+   }
+   
+   public function restrictedFields(){
+      return $restricted_fields = [
+         "id",
+         "created_at",
+         "updated_at"
+      ];
+   }
+
+   public function fetchData(Request $request){
+      $field = StatisticsField::findOrfail($request->field);     
+      $table = StatisticsTable::findOrfail($request->table);
+      //$fields = StatisticsField::with(['table', 'extension'])->get();
+
+      $query = $this->buildQuery($request->question, $table->name, $field, $request->filter, $request->fields_to_show);
+      $result = DB::select($query);
+
+      $headers = [];
+
+      $restricted_fields = $this->restrictedFields();
+
+      if(isset($result[0])){
+         foreach($result[0] as $key => $res){
+            if(!\in_array($key, $restricted_fields)){
+               $headers[] = [
+                  "text" => $this->unslugify($key),
+                  "value" => $key,
+               ];
+            }
+         }
+      }
+      
+      $query_results = [
+         "query" => $query,
+         "headers" => $headers,
+         "items" => $result,
+      ];
+
+      return response()->json($query_results);
+   }
+
+   public function buildQuery($question_type, $table, $field, $filters, $fields_to_show = []){
+      $query = "SELECT ";
+
+      //Initial fetch
+      if(count($fields_to_show) == 0)
+         $query .= " $table.*, ";
+      
+         if($question_type == "numeric"){
+         if(count($fields_to_show) == 0){
+            $query .= " COUNT(*)";
+         }
+         else{
+            $normal_fields = [];
+            $count_fields = [];
+
+            foreach($fields_to_show as $index => $field){      
+               $field_to_show = StatisticsField::findOrfail($field);      
+               
+               if($field_to_show->isForeign){
+                  $normal_fields[] = $field_to_show->extension->table . "." . $field_to_show->extension->field . " as " . $field_to_show->display;
+                  $count_fields[] = "COUNT(" . $field_to_show->extension->table . "." . $field_to_show->extension->field . ")";
+               }
+               else{
+                  $normal_fields[] = $table . "." . $field_to_show->name . " as " . $field_to_show->display;
+                  $count_fields[] = "COUNT(" . $table . "." . $field_to_show->name . ")";
+               }   
+               
+            }
+            
+            $query .= implode(", ", $normal_fields) . ", COUNT(*)";
+         }
+      }
+      elseif($question_type == "text"){
+         if(count($fields_to_show) == 0){
+            $query .= " $table.*";
+         }
+         else{
+            foreach($fields_to_show as $index => $field){   
+               if($index > 0){
+                  $query .= ",";
+               }
+               $query .= " " . $field['field'];
+            }
+         }
+      }
+
+      //Load selected fields
+      
+      //load table
+      $query_tables = [];
+      $query_fields = [];
+      $query .= " FROM ";
+
+      if($field->isForeign){
+         $query .= $table . " LEFT JOIN " . $field->extension->table
+         . " ON " . $field->table->name . "." . $field->name 
+         . " = " . $field->extension->table . ".id";
+      }
+      else{
+         $query .= $table;
+      }
+      
+
+      //load filters
+      if($filter != ""){
+         $query .= " WHERE ";
+         if($field->isForeign){
+            if($field->extension->isMultiLang)
+               $query .= "JSON_EXTRACT(" . $field->extension->table . "." . $field->extension->field . ", '$." . $langCode . "') LIKE '%" . $filters[$index] . "%'";
+            else
+               $query .= $field->extension->table . "." . $field->extension->field;  
+         }
+         else{
+            if($field->extension->isMultiLang)
+               $query .= "JSON_EXTRACT(" . $field->table->name . "." . $field->name . ", '$." . $langCode . "') LIKE '%" . $filters[$index] . "%'";
+            else
+            $query .= $table . "." . $field->name;
+         }
+
+         $query .= " LIKE '%" . $filter . "%'";
+      }
+
+
+      //Group by
+      $group_by = "";
+      $group_filters = [];
+      if($question_type == "numeric"){
+         foreach($fields as $index => $field){
+            if($filters[$index] == null)
+               $filter = "";
+            else
+               $filter = $filters[$index];
+
+            if($filter == ""){
+               if($group_by == ""){
+                  $group_by .=  " GROUP BY";
+               }
+               
+               if($field->isForeign)
+                  $group_filters[] = " " . $field->extension->table . "." . $field->extension->field;  //has Join
+               else
+                  $group_filters []= " " . $field->table->name . "." . $field->name;
+            }
+         }
+
+         if(count($group_filters) > 0){
+            $group_by .= implode(", ", $group_filters);
+            $query .= $group_by;
+         }
+      }
+
+      //dd($query);
+      return $query;
+   }
+
+   public function join($table1, $table2, $link){
+      return $table1 . " LEFT JOIN " . $table2 . " ON " . $link;
+   }
+
+   public function loadQuery(Request $request) {
+      $query = $this->queryBuilder($request->all());
+      $result = DB::select($query);
+
+      $headers = [];
+
+      $restricted_fields = $this->restrictedFields();
+
+      if(isset($result[0])){
+         foreach($result[0] as $key => $res){
+            if(!\in_array($key, $restricted_fields)){
+               $headers[] = [
+                  "text" => $this->unslugify($key),
+                  "value" => $key,
+               ];
+            }
+         }
+      }
+
+      $query_results = [
+         "query" => $query,
+         "headers" => $headers,
+         "items" => $result,
+      ];
+
+      return response()->json($query_results);
+   }
+
+
+   public function queryBuilder($request_query){
+      $table = $request_query["table"];
+      
+      $fields = $request_query["fields"];
+      $filters = $request_query["filters"];
+
+      //Combine fields and filters
+      for($i = 0; $i < count($fields); $i++){
+         $fields[$i]["filter"] = isset($filters[$i]) ? $filters[$i] : "";
+      }
+      
+      //Reset Filters
+      $filters = [];
+      foreach($fields as $field){
+         $filters[] = $field["filter"];
+      }
+
+      $query = "SELECT ";
+
+      if($request_query["question"] == "numeric"){
+         if(count($request_query["fields_to_show"]) == 0){
+            $query .= " *, COUNT(*)";
+         }
+         else{
+            $normal_fields = [];
+            $count_fields = [];
+
+            foreach($request_query["fields_to_show"] as $index => $field){               
+               $normal_fields[] = $field['field'];
+               $count_fields[] = "COUNT(" . $field['field'] . ")";
+            }
+
+            $query .= implode(", ", $normal_fields) . ", COUNT(*)";
+         }
+      }
+      elseif($request_query["question"] == "text"){
+         if(count($request_query["fields_to_show"]) == 0){
+            $query .= " *";
+         }
+         else{
+            foreach($request_query["fields_to_show"] as $index => $field){   
+               if($index > 0){
+                  $query .= ",";
+               }
+               $query .= " " . $field['field'];
+            }
+         }
+      }
+
+      $query .= " FROM";
+
+      $query .= " " . $table;
+
+      if(count($fields) > 0){
+         $query .= " WHERE";
+      }
+      
+      for($i = 0; $i < count($fields); $i++){
+         if($i > 0){
+            $query .= " AND";
+         }
+
+         $query .= " " . $fields[$i]["field"] . " LIKE '%" . $fields[$i]["filter"]. "%'";
+      }
+
+      $group_by = "";
+      $group_filters = [];
+      if($request_query["question"] == "numeric"){
+         foreach($filters as $filter_index => $filter){
+            if($filter == null)
+               $filter = "";
+
+            if($filter == ""){
+               if($group_by == ""){
+                  $group_by .=  " GROUP BY ";
+               }
+               $group_filters[] = $fields[$filter_index]["field"];
+            }
+         }
+
+         if(count($group_filters) > 0){
+            $group_by .= implode(", ", $group_filters);
+            $query .= $group_by;
+         }
+      }
+      
+      
+
+      return $query;
+   }
+}

@@ -10,8 +10,8 @@
 
 ### Demo Credentials
 
-**User:** admin@admin.com  
-**Password:** secret
+**User:** *****@*****.com  
+**Password:** ******
 
 ### Official Documentation
 
